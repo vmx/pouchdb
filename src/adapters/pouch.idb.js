@@ -630,6 +630,18 @@ var IdbPouch = function(opts, callback) {
     viewQuery(fun, idb, opts);
   }
 
+  api.spatial = function(fun, opts, callback) {
+    if (opts instanceof Function) {
+      callback = opts;
+      opts = {};
+    }
+    if (callback) {
+      opts.complete = callback;
+    }
+
+    spatialQuery(fun, idb, opts);
+  };
+
   // Wrapper for functions that call the bulkdocs api with a single doc,
   // if the first result is an error, return an error
   var yankError = function(callback) {
@@ -688,6 +700,89 @@ var IdbPouch = function(opts, callback) {
       }
     }
   }
+
+  var spatialQuery = function (fun, idb, options) {
+
+    var txn = idb.transaction([DOC_STORE, BY_SEQ_STORE], IDBTransaction.READ);
+    var objectStore = txn.objectStore(DOC_STORE);
+    var request = objectStore.openCursor();
+    var mapContext = {};
+    var results = [];
+    var current;
+
+    var calculate_bbox = function (geom) {
+      var coords = geom.coordinates;
+      if (geom.type === 'Point') {
+        return [coords[0], coords[1], coords[0], coords[1]];
+      }
+      if (geom.type === 'GeometryCollection') {
+        coords = geom.geometries.map(function(g) {
+          return calculate_bbox(g);
+        });
+        return coords.reduce(function (a, b) {
+          var minX = Math.min(a[0], b[0]);
+          var minY = Math.min(a[1], b[1]);
+          var maxX = Math.max(a[2], b[0]);
+          var maxY = Math.max(a[3], b[1]);
+          return [minX, minY, maxX, maxY];
+        });
+      }
+
+      // Flatten coords as much as possible
+      while (Array.isArray(coords[0][0])) {
+        coords = coords.reduce(function(a, b) {
+          return a.concat(b);
+        });
+      };
+
+      return coords.reduce(function (acc, coord) {
+        // The first element isn't a bbox yet
+        if (acc.length === 2) {
+          acc = [acc[0], acc[1], acc[0], acc[1]];
+        }
+        var minX = Math.min(acc[0], coord[0]);
+        var minY = Math.min(acc[1], coord[1]);
+        var maxX = Math.max(acc[2], coord[0]);
+        var maxY = Math.max(acc[3], coord[1]);
+        return [minX, minY, maxX, maxY];
+      });
+    };
+
+    emit = function(geom, val) {
+      var bbox = calculate_bbox(geom);
+      results.push({
+        id: current._id,
+        geometry: geom,
+        bbox: bbox,
+        value: val
+      });
+    };
+
+    request.onsuccess = function (e) {
+      var cursor = e.target.result;
+      if (!cursor) {
+        if (options.complete) {
+          options.complete(null, {rows: results});
+        }
+      } else {
+        var nreq = txn
+          .objectStore(BY_SEQ_STORE).get(e.target.result.value.seq)
+          .onsuccess = function(e) {
+            current = e.target.result;
+            if (options.complete) {
+              fun.apply(mapContext, [current]);
+            }
+            cursor['continue']();
+          };
+      }
+    };
+
+    request.onerror = function (error) {
+      if (options.error) {
+        options.error(error);
+      }
+    };
+  };
 
   return api;
 
