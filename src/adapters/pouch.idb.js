@@ -701,23 +701,27 @@ var IdbPouch = function(opts, callback) {
     }
   }
 
-  var spatialQuery = function (fun, idb, options) {
+  var spatialQuery = function (fun, idb, opts) {
 
     var txn = idb.transaction([DOC_STORE, BY_SEQ_STORE], IDBTransaction.READ);
     var objectStore = txn.objectStore(DOC_STORE);
     var request = objectStore.openCursor();
     var mapContext = {};
+    // The results of the map function on one document
+    var singleDocResults = [];
+    // The total results that will be returned
     var results = [];
     var current;
+    var queryBbox = 'bbox' in opts ? JSON.parse('['+ opts.bbox +']') : null;
 
-    var calculate_bbox = function (geom) {
+    var calculateBbox = function (geom) {
       var coords = geom.coordinates;
       if (geom.type === 'Point') {
         return [coords[0], coords[1], coords[0], coords[1]];
       }
       if (geom.type === 'GeometryCollection') {
         coords = geom.geometries.map(function(g) {
-          return calculate_bbox(g);
+          return calculateBbox(g);
         });
         return coords.reduce(function (a, b) {
           var minX = Math.min(a[0], b[0]);
@@ -748,9 +752,21 @@ var IdbPouch = function(opts, callback) {
       });
     };
 
+    // Calculates whether two bounding boxes are disjoint or not
+    var disjoint = function(a, b) {
+      xMin = Math.max(a[0], b[0]);
+      xMax = Math.min(a[2], b[2]);
+      yMin = Math.max(a[1], b[1]);
+      yMax = Math.min(a[3], b[3]);
+
+      return (xMin > xMax || yMin > yMax);
+    };
+
+    // There can be severl emits per function, hence store the results
+    // in an array
     emit = function(geom, val) {
-      var bbox = calculate_bbox(geom);
-      results.push({
+      var bbox = calculateBbox(geom);
+      singleDocResults.push({
         id: current._id,
         geometry: geom,
         bbox: bbox,
@@ -761,16 +777,24 @@ var IdbPouch = function(opts, callback) {
     request.onsuccess = function (e) {
       var cursor = e.target.result;
       if (!cursor) {
-        if (options.complete) {
-          options.complete(null, {rows: results});
+        if (opts.complete) {
+          opts.complete(null, {rows: results});
         }
       } else {
         var nreq = txn
           .objectStore(BY_SEQ_STORE).get(e.target.result.value.seq)
           .onsuccess = function(e) {
             current = e.target.result;
-            if (options.complete) {
+            if (opts.complete) {
+              singleDocResults = [];
               fun.apply(mapContext, [current]);
+              // Filter out the results that should end up in the
+              // final output
+              singleDocResults.forEach(function(result) {
+                if (queryBbox === null || !disjoint(result.bbox, queryBbox)) {
+                  results.push(result);
+                }
+              });
             }
             cursor['continue']();
           };
@@ -778,8 +802,8 @@ var IdbPouch = function(opts, callback) {
     };
 
     request.onerror = function (error) {
-      if (options.error) {
-        options.error(error);
+      if (opts.error) {
+        opts.error(error);
       }
     };
   };
